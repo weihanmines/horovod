@@ -60,6 +60,7 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
     log_every_n_steps = estimator.getLogEveryNSteps()
     data_loader_cls = estimator.getDataLoaderClass()
     loader_num_epochs = estimator.getLoaderNumEpochs()
+    verbose = (estimator.getVerbose() > 0)
 
     # Data reader parameters
     train_reader_worker_count = estimator.getTrainReaderNumWorker()
@@ -83,6 +84,10 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
     # Storage
     store = estimator.getStore()
     remote_store = store.to_remote(run_id, dataset_idx)
+
+    set_data_loader = _set_data_loader_fn(transformation, schema_fields,
+                                          batch_size, calculate_shuffle_buffer_size,
+                                          data_loader_cls, loader_num_epochs, verbose)
 
     def train(serialized_model):
         import horovod.torch as hvd
@@ -118,12 +123,14 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
 
             model = deserialize(serialized_model)
 
-            _train_steps_per_epoch = train_steps_per_epoch
-            if _train_steps_per_epoch is None:
-                _train_steps_per_epoch = int(math.floor(float(train_rows) / batch_size / hvd.size()))
-            _val_steps_per_epoch = val_steps_per_epoch
-            if _val_steps_per_epoch is None:
-                _val_steps_per_epoch = int(math.floor(float(val_rows) / batch_size / hvd.size()))
+            _train_steps_per_epoch = train_steps_per_epoch if train_steps_per_epoch else \
+                int(math.floor(float(train_rows) / batch_size / hvd.size()))
+
+            _val_steps_per_epoch = val_steps_per_epoch if val_steps_per_epoch else \
+                int(math.floor(float(val_rows) / val_batch_size / hvd.size()))
+
+            print(f"Training data of rank[{hvd.local_rank()}]: train_rows:{train_rows}, batch_size:{batch_size}, _train_steps_per_epoch:{_train_steps_per_epoch}.")
+            print(f"Validation data of rank[{hvd.local_rank()}]: val_rows:{val_rows}, val_batch_size:{val_batch_size}, _val_steps_per_epoch:{_val_steps_per_epoch}, should_validate:{should_validate}")
 
             cuda_available = torch.cuda.is_available()
             # We need to check all ranks have same device type for traning.
@@ -146,14 +153,13 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
                       'gpus': _num_gpus,
                       'callbacks': callbacks,
                       'max_epochs': epochs,
-                      'limit_train_batches': _train_steps_per_epoch,
-                      'limit_val_batches': _val_steps_per_epoch,
                       'logger': train_logger,
                       'log_every_n_steps': log_every_n_steps,
                       'resume_from_checkpoint': (last_ckpt_file if ckpt_bytes else None),
                       'checkpoint_callback': is_model_checkpoint_callback_exist,
                       'num_sanity_val_steps': 0,
-                      'reload_dataloaders_every_epoch': False
+                      'reload_dataloaders_every_epoch': False,
+                      'progress_bar_refresh_rate': _train_steps_per_epoch // 10
                       }
             print("Creating trainer with: \n ", kwargs)
             trainer = Trainer(**kwargs)
@@ -167,9 +173,13 @@ def RemoteTrainer(estimator, metadata, ckpt_bytes, run_id, dataset_idx, train_ro
             #     print(row_group)
 
             with set_data_loader(model, remote_store.train_data_path, 'train_dataloader',
-                                       train_reader_worker_count, reader_pool_type), \
+                                 train_reader_worker_count, reader_pool_type,
+                                 name="train_dataloader",
+                                 limit_step_per_epoch=_train_steps_per_epoch), \
                     set_data_loader(model, remote_store.val_data_path, 'val_dataloader',
-                                          val_reader_worker_count, reader_pool_type, should_validate):
+                                    val_reader_worker_count, reader_pool_type,
+                                    should_validate, name="val_dataloader",
+                                    limit_step_per_epoch=_val_steps_per_epoch):
 
                 trainer.fit(model)
 
@@ -212,10 +222,10 @@ def _make_reset_callbacks():
     return [ResetCallback()]
 
 
-def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shuffle_buffer_size, data_loader_cls, num_epochs):
+def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shuffle_buffer_size, data_loader_cls, num_epochs, verbose=False):
 
     @contextlib.contextmanager
-    def set_data_loader(model, data_path, dataloader_attr, reader_worker_count, reader_pool_type, should_read=True):
+    def set_data_loader(model, data_path, dataloader_attr, reader_worker_count, reader_pool_type, should_read=True, name="", limit_step_per_epoch=-1):
         from petastorm import TransformSpec, make_reader, make_batch_reader
         import horovod.torch as hvd
 
@@ -225,8 +235,11 @@ def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shu
             is_loader_overridden = is_overridden(dataloader_attr, model)
 
         if not should_read or is_loader_overridden:
+            print(f"Will not set data loader: {name}.")
             yield
             return
+
+        print(f"Setting data loader {name} with limit_step_per_epoch={limit_step_per_epoch}")
 
         transform_spec = TransformSpec(transformation) if transformation else None
 
@@ -257,7 +270,10 @@ def _set_data_loader_fn(transformation, schema_fields, batch_size, calculate_shu
                             **reader_factory_kwargs) as reader:
             def dataloader_fn():
                 return data_loader_cls(reader=reader, batch_size=batch_size,
-                                       shuffling_queue_capacity=calculate_shuffle_buffer_size())
+                                       shuffling_queue_capacity=calculate_shuffle_buffer_size(),
+                                       name=name,
+                                       limit_step_per_epoch=limit_step_per_epoch,
+                                       verbose=verbose)
             try:
                 setattr(model, dataloader_attr, dataloader_fn)
                 yield
@@ -313,9 +329,9 @@ def _calculate_shuffle_buffer_size_fn(train_rows, avg_row_size, user_shuffle_buf
 
 def _create_dataloader(feature_columns, input_shapes, metadata, data_loader_cls=None):
     if data_loader_cls is None:
-        # set PytorchAsyncDataLoader as default
-        from horovod.spark.data_loaders.pytorch_data_loaders import PytorchAsyncDataLoader
-        data_loader_cls = PytorchAsyncDataLoader
+        # set PytorchInfiniteAsyncDataLoader as default
+        from horovod.spark.data_loaders.pytorch_data_loaders import PytorchInfiniteAsyncDataLoader
+        data_loader_cls = PytorchInfiniteAsyncDataLoader
 
     print(f"Using dataloader: {data_loader_cls}")
 
